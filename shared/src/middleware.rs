@@ -1,24 +1,12 @@
-use std::{
-    cell::RefCell,
-    net::{IpAddr, SocketAddr},
-};
-
 use axum::{
-    body::HttpBody,
-    extract::ConnectInfo,
-    middleware::{self, Next},
-    response::{IntoResponse, Response},
+    middleware::Next,
+    response::Response,
 };
-use http::{
-    header::{self, HeaderName},
-    HeaderValue, Method, Request, StatusCode, Uri,
-};
+use http::{StatusCode, Request};
 use hyper::Body;
-use tokio::sync::{oneshot, Mutex};
-use tracing::{info, instrument::{self, WithSubscriber}, span, warn, Level, info_span, field::{self, display}, Instrument, Span, Subscriber, Event};
+use tracing::{info, warn, info_span, field, Instrument, Span};
 
 use beam_lib::AppOrProxyId;
-use tracing_subscriber::{fmt::{FormatEvent, FmtContext, format::{self, FmtSpan}, FormatFields}, registry::LookupSpan};
 
 pub async fn log(
     req: Request<Body>,

@@ -11,7 +11,7 @@ use hyper::StatusCode;
 use once_cell::sync::Lazy;
 use serde::Serialize;
 use serde_json::json;
-use beam_lib::{AppOrProxyId, MsgEmpty, MsgId};
+use beam_lib::{AppOrProxyId, MsgEmpty, MsgId, WorkStatus};
 use shared::{
     HasWaitId, HowLongToBlock, Msg, MsgSigned,
     MsgState, MsgTaskRequest, MsgTaskResult, sse_event::SseEventType,
@@ -26,6 +26,10 @@ pub trait Task {
     /// Returns true if the value as been updated and false if it was a result from a new app
     fn insert_result(&mut self, result: Self::Result) -> bool;
     fn is_expired(&self) -> bool;
+}
+
+pub trait HasStatus {
+    fn get_status(&self) -> WorkStatus;
 }
 
 impl<State: MsgState> Task for MsgTaskRequest<State> {
@@ -63,6 +67,18 @@ impl<State: MsgState> Task for shared::MsgSocketRequest<State> {
     }
 }
 
+impl<T: MsgState> HasStatus for MsgTaskResult<T> {
+    fn get_status(&self) -> WorkStatus {
+        self.status
+    }
+}
+
+impl<T: HasStatus + Msg> HasStatus for MsgSigned<T> {
+    fn get_status(&self) -> WorkStatus {
+        self.msg.get_status()
+    }
+}
+
 pub struct TaskManager<T: HasWaitId<MsgId> + Task + Msg> {
     tasks: DashMap<MsgId, MsgSigned<T>>,
     new_tasks: broadcast::Sender<MsgId>,
@@ -81,9 +97,9 @@ impl<T: HasWaitId<MsgId> + Task + Msg + Send + Sync + 'static> TaskManager<T> {
             new_results: Default::default(),
         });
         let tm = Arc::clone(&task_manager);
-        tokio::spawn(async move {
+        std::thread::spawn(move || {
             loop {
-                tokio::time::sleep(Self::EXPIRE_CHECK_INTERVAL).await;
+                std::thread::sleep(Self::EXPIRE_CHECK_INTERVAL);
                 tm.tasks.retain(|_, task| if task.msg.is_expired() {
                     tm.new_results.remove(&task.msg.wait_id());
                     false
@@ -187,7 +203,7 @@ fn decide_blocking_conditions(block: &HowLongToBlock) -> (usize, Instant) {
 
 impl<T: HasWaitId<MsgId> + Task + Msg> TaskManager<T>
 where
-    T::Result: Msg,
+    T::Result: Msg + HasStatus,
 {
     /// This does not check if the requester was the creator of the Task
     pub async fn wait_for_results(
@@ -202,7 +218,7 @@ where
             .msg
             .get_results()
             .values()
-            .filter(|result| filter(result))
+            .filter(|result| filter(result) && result.get_status() != WorkStatus::Claimed)
             .count();
         let mut new_results = self
             .new_results
@@ -218,7 +234,8 @@ where
                     match result {
                         Ok(key) => {
                             if let Ok(task) = self.get(task_id) {
-                                if filter(&task.msg.get_results()[&key]) {
+                                let result = &task.msg.get_results()[&key];
+                                if filter(result) && result.get_status() != WorkStatus::Claimed {
                                     num_of_results += 1;
                                 }
                             } else {
@@ -240,36 +257,46 @@ where
         self.get(task_id).map_err(|_| TaskManagerError::Gone)
     }
 
-    pub fn stream_results<'a>(
-        &'a self,
-        task_id: &'a MsgId,
-        block: &'a HowLongToBlock,
-        filter: impl Fn(&T::Result) -> bool + 'a
-    ) -> impl Stream<Item = Result<Event, Infallible>> + 'a
-        where T::Result: Serialize
+    pub fn stream_results(
+        self: Arc<Self>,
+        task_id: MsgId,
+        block: HowLongToBlock,
+        filter: impl Fn(&T::Result) -> bool + 'static + Send + Sync
+    ) -> impl Stream<Item = Result<Event, Infallible>> + 'static + Send
+        where
+            T::Result: Serialize + Sync + Send,
+            T: Send + Sync + 'static
     {
         async_stream::stream! {
-            let Ok(task) = self.get(task_id) else {
+            let Ok(task) = self.get(&task_id) else {
                 yield Ok(to_event("Did not find task", SseEventType::Error));
                 return;
             };
-            let (max_elements, wait_until) = decide_blocking_conditions(block);
+            let (max_elements, wait_until) = decide_blocking_conditions(&block);
             let ready_results = task.msg
                 .get_results()
                 .values()
                 .filter(|result| filter(result));
             let mut num_of_results = 0;
+            let mut events = Vec::with_capacity(task.msg.get_results().len());
             for res in ready_results {
-                yield Ok(to_event(res, SseEventType::NewResult));
-                num_of_results += 1;
+                if res.get_status() != WorkStatus::Claimed {
+                    num_of_results += 1;
+                }
+                events.push(to_event(res, SseEventType::NewResult));
                 // Only break when wait_count was actually set otherwise we want all the tasks that are present
-                if num_of_results >= max_elements && max_elements!=0 {
+                if num_of_results >= max_elements && max_elements != 0 {
                     break;
                 }
             }
+            // Drop lock before doing async stuff
+            drop(task);
+            for event in events {
+                yield Ok(event);
+            }
             let mut new_results = self
                 .new_results
-                .get(task_id)
+                .get(&task_id)
                 .expect("Found task but no corresponding results channel")
                 .subscribe();
             while num_of_results < max_elements && Instant::now() < wait_until {
@@ -281,19 +308,27 @@ where
                     result = new_results.recv() => {
                         match result {
                             Ok(key) => {
-                                if let Ok(task) = self.get(task_id) {
+                                if let Ok(task) = self.get(&task_id) {
                                     let new_result = &task.msg.get_results()[&key];
                                     if filter(new_result) {
-                                        num_of_results += 1;
-                                        yield Ok(to_event(new_result, SseEventType::NewResult));
+                                        if new_result.get_status() != WorkStatus::Claimed {
+                                            num_of_results += 1;
+                                        }
+                                        let event = to_event(new_result, SseEventType::NewResult);
+                                        drop(task);
+                                        yield Ok(event);
                                     };
                                 } else {
                                     yield Ok(to_event(json!({"task_id": task_id}), SseEventType::DeletedTask));
                                 }
                             },
-                            Err(e) => {
-                                warn!("new_results channel lagged: {e}");
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                warn!("new_results channel lagged by: {n} results.");
                                 yield Ok(to_event("Internal server error", SseEventType::Error));
+                            },
+                            Err(broadcast::error::RecvError::Closed) => {
+                                yield Ok(to_event("Task expired", SseEventType::WaitExpired));
+                                break;
                             }
                         }
                     },
@@ -339,7 +374,7 @@ impl TaskManagerError {
         match self {
             TaskManagerError::NotFound => "Task not found",
             TaskManagerError::Conflict => "Task already exists",
-            TaskManagerError::Unauthorized => "Unautherized to access this task",
+            TaskManagerError::Unauthorized => "Unauthorized to access this task",
             TaskManagerError::Gone => "Task expired while waiting on it",
             TaskManagerError::BroadcastBufferOverflow => "Internal server error",
         }
